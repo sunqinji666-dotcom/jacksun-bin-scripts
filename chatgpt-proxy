@@ -1,0 +1,7 @@
+#!/bin/bash
+# 通过 xray 代理 (127.0.0.1:10607) 启动 ChatGPT
+# 使用 Chromium 的 --proxy-server 参数，无需修改 app 签名
+
+open -a /Applications/ChatGPT.app --args \
+  --proxy-server="http://127.0.0.1:10607" \
+  --proxy-bypass-list="<-loopback>"
