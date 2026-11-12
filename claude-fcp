@@ -1,0 +1,4 @@
+#!/bin/zsh
+# 按需加载 SpliceKit MCP：只有用这个命令开的会话才挂 splicekit（231 个 FCP 工具）。
+# 前提：补丁版 FCP 在跑（~/Applications/SpliceKit/Final Cut Pro.app）。同一时间只开一个会话，避免桥并发崩溃。
+cd "$HOME/Documents" && exec /Users/jacksun/.local/bin/claude --mcp-config /Users/jacksun/.claude/splicekit-mcp.json "$@"

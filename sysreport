@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""采集本机状态并上报给小电视服务器。
+
+每 30 秒跑一次（launchd），一次采样约 1 秒——CPU 使用率和网速都要两次读数相减。
+网络请求走直连，不吃本机代理。
+"""
+import json
+import os
+import socket
+import subprocess
+import time
+
+import psutil
+
+CURL = '/usr/bin/curl'
+
+URL = 'https://news.jack-sun.com/device/mac'
+KEYFILE = os.path.expanduser('~/.macreport.key')
+GB = 1024.0 ** 3
+
+
+def gb(n):
+    return round(n / GB, 1)
+
+
+def human_uptime(sec):
+    d, r = divmod(int(sec), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d:
+        return '%d天%d小时' % (d, h)
+    if h:
+        return '%d小时%d分' % (h, m)
+    return '%d分' % m
+
+
+def nice_host():
+    h = socket.gethostname().split('.')[0]
+    return h.replace('MacBook-Pro', 'MacBook Pro').replace('MacBookPro', 'MacBook Pro')
+
+
+def sample():
+    n1 = psutil.net_io_counters()
+    t1 = time.time()
+    cpu = psutil.cpu_percent(interval=1.0)
+    n2 = psutil.net_io_counters()
+    t2 = time.time()
+    dt = max(t2 - t1, 0.001)
+
+    mem = psutil.virtual_memory()
+    # macOS 的 / 是只读系统卷（约 14G），真实数据在同容器的 Data 卷
+    data_vol = '/System/Volumes/Data'
+    du = psutil.disk_usage(data_vol if os.path.isdir(data_vol) else '/')
+    b = psutil.sensors_battery()
+    la = psutil.getloadavg()
+    return {
+        'ts': int(t2),
+        'host': nice_host(),
+        'cpu': round(cpu),
+        'mem': round(mem.percent),
+        'mem_used': gb(mem.used),
+        'mem_total': gb(mem.total),
+        'disk': round(du.percent),
+        'disk_used': round(du.used / GB),
+        'disk_total': round(du.total / GB),
+        'batt': round(b.percent) if b else -1,
+        'plug': 1 if (b and b.power_plugged) else 0,
+        'up': round((n2.bytes_sent - n1.bytes_sent) / dt / 1048576, 2),
+        'down': round((n2.bytes_recv - n1.bytes_recv) / dt / 1048576, 2),
+        'load1': round(la[0], 2),
+        'uptime': human_uptime(time.time() - psutil.boot_time()),
+        'procs': len(psutil.pids()),
+    }
+
+
+def main():
+    for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY'):
+        os.environ.pop(k, None)
+    data = sample()
+    try:
+        with open(KEYFILE) as f:
+            key = f.read().strip()
+    except OSError:
+        raise SystemExit('缺少 %s' % KEYFILE)
+    req = json.dumps(data).encode('utf-8')
+    # 系统 Python 3.9 的 OpenSSL 太旧，和站点的 TLS 套件握不上手（SSLV3_ALERT_HANDSHAKE_FAILURE），改用 curl
+    r = subprocess.run(
+        [CURL, '-s', '-m', '10', '--noproxy', '*', '-X', 'POST',
+         '-H', 'Content-Type: application/json', '-H', 'X-Token: ' + key,
+         '--data-binary', '@-', URL],
+        input=req, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(r.returncode, r.stdout.decode('utf-8', 'replace')[:120])
+
+
+if __name__ == '__main__':
+    main()

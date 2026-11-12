@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# bark —— 往 iPhone 推通知的命令行工具
+#
+# 用法:
+#   bark 正文
+#   bark 标题 正文
+#   bark 标题 副标题 正文
+#
+# 选项:
+#   -p          强制明文推送（默认走加密，前提是配置里有 BARK_SECRET）
+#   -g 分组     消息分组，同一个分组可在手机上整体静音
+#   -s 铃声     自定义铃声，如 minuet / birdsong
+#   -u URL      点击通知跳转的地址
+#   -l 级别     active(默认) | timeSensitive | passive | critical
+#   -i 图标URL  自定义通知图标（替换默认的 Bark 图标）
+#   -m 图片URL  通知里带一张大图，下拉展开可见
+#   -c          强提醒：铃声循环 30 秒（配合 -l critical 效果最强）
+#   -h          显示这段帮助
+#
+# 配置: ~/.bark.conf，提供 BARK_KEY / BARK_SECRET / BARK_SERVER
+#
+# 加密说明: 走加密时正文加密成 ciphertext 发出，Bark 服务器和苹果都看不到内容，
+#           只有你手机上配了同一个 BARK_SECRET 的 App 能解开。
+
+set -euo pipefail
+
+CONF="${BARK_CONF:-$HOME/.bark.conf}"
+if [ ! -r "$CONF" ]; then
+  echo "错误：读不到配置文件 $CONF" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$CONF"
+set +a
+
+KEY="${BARK_KEY:?配置文件里缺少 BARK_KEY}"
+SECRET="${BARK_SECRET:-}"
+SERVER="${BARK_SERVER:-https://api.day.app}"
+
+plain=0; group=""; sound=""; jump=""; level=""; icon=""; image=""; call=""
+
+while getopts ":pg:s:u:l:i:m:ch" opt; do
+  case "$opt" in
+    p) plain=1 ;;
+    g) group="$OPTARG" ;;
+    s) sound="$OPTARG" ;;
+    u) jump="$OPTARG" ;;
+    l) level="$OPTARG" ;;
+    i) icon="$OPTARG" ;;
+    m) image="$OPTARG" ;;
+    c) call="1" ;;
+    h) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    \?) echo "未知选项 -$OPTARG" >&2; exit 2 ;;
+    :)  echo "选项 -$OPTARG 需要跟一个参数" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ $# -eq 0 ]; then
+  echo "用法: bark [-p] [-g 分组] [-s 铃声] [-u 跳转] [-l 级别] [-m 图片] [-c] 正文 | 标题 正文 | 标题 副标题 正文" >&2
+  exit 2
+fi
+
+title=""; subtitle=""; body=""
+if   [ $# -eq 1 ]; then body="$1"
+elif [ $# -eq 2 ]; then title="$1"; body="$2"
+else                    title="$1"; subtitle="$2"; body="$3"
+fi
+
+# 用 python3 拼 JSON —— 中文、空格、引号、星号统统不用手工转义
+payload=$(python3 -c '
+import json, sys
+keys = ("title","subtitle","body","group","sound","url","level","icon","image","call")
+d = {k: v for k, v in zip(keys, sys.argv[1:]) if v}
+print(json.dumps(d, ensure_ascii=False))
+' "$title" "$subtitle" "$body" "$group" "$sound" "$jump" "$level" "$icon" "$image" "$call")
+
+if [ "$plain" = "1" ] || [ -z "$SECRET" ]; then
+  curl -sS -X POST -H 'Content-Type: application/json; charset=utf-8' \
+    --data-binary "$payload" "$SERVER/$KEY"
+else
+  iv_raw=$(openssl rand -hex 8)
+  key_hex=$(printf '%s' "$SECRET" | xxd -ps -c 200)
+  iv_hex=$(printf '%s' "$iv_raw" | xxd -ps -c 200)
+  ciphertext=$(printf '%s' "$payload" \
+    | openssl enc -aes-128-cbc -K "$key_hex" -iv "$iv_hex" -base64 \
+    | tr -d '\n')
+  curl -sS -X POST \
+    --data-urlencode "ciphertext=$ciphertext" \
+    --data-urlencode "iv=$iv_raw" \
+    "$SERVER/$KEY"
+fi
+echo

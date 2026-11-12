@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ds — 把子任务派给 DeepSeek V4.1-Flash 跑（孙哥的模型路由工具）
+
+用法：
+  ds "prompt"                单条，结果输出到 stdout，用量打 stderr
+  ds -f prompt.txt           从文件读 prompt
+  cat prompt.txt | ds        从 stdin 读
+  ds --jsonl tasks.jsonl     批量并发：每行 {"id":..,"prompt":..}
+                             输出 JSONL：{"id","response","usage"}（-o 存文件）
+
+视觉（V4.1-Flash 支持多模态，可传图）：
+  ds --image a.jpg "描述这张图"
+  ds --image a.jpg --image b.jpg "对比这两张"
+  ds --jsonl t.jsonl 时每行可带 {"images":["a.jpg","b.jpg"]}
+  本地图片自动 base64 内联；也接受 http(s) URL 和已是 data: 开头的串。
+
+选项：
+  --image PATH|URL  附一张图（可重复）
+  --image-max-edge N  传图前缩到最长边不超过 N 像素，默认 1280（省 token）
+  --max-tokens N    单条输出上限，默认 16384
+  --concurrency N   批量并发数，默认 4
+  --model ID        默认 deepseek-flash（可换 deepseek-v4-pro）
+  --timeout S       单条超时秒数，默认 240
+"""
+import json, sys, time, argparse, base64, io, os, mimetypes
+from urllib.request import Request, urlopen
+from concurrent.futures import ThreadPoolExecutor
+
+API = "https://api.deepseek.com/chat/completions"
+def _load_key():
+    """API Key 从环境变量 DEEPSEEK_API_KEY 或 ~/.deepseek-api-key 读取，不写死在代码里。"""
+    k = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if k:
+        return k
+    p = os.path.expanduser("~/.deepseek-api-key")
+    if os.path.exists(p):
+        return open(p, encoding="utf-8").read().strip()
+    sys.exit("缺少 DeepSeek API Key：设置 DEEPSEEK_API_KEY 或写入 ~/.deepseek-api-key")
+
+
+KEY = _load_key()
+
+
+def encode_image(path, max_edge):
+    """本地路径 → data URL；http(s)/data: 原样返回。缩放到 max_edge 省 token。"""
+    if path.startswith(("http://", "https://", "data:")):
+        return path
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    raw = open(path, "rb").read()
+    mt = mimetypes.guess_type(path)[0] or "image/jpeg"
+    # 尝试用 PIL 缩放（没装就原样发）
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        w, h = im.size
+        if max(w, h) > max_edge:
+            k = max_edge / max(w, h)
+            im = im.resize((max(1, int(w * k)), max(1, int(h * k))), Image.LANCZOS)
+        buf = io.BytesIO(); im.save(buf, format="JPEG", quality=88)
+        raw, mt = buf.getvalue(), "image/jpeg"
+    except Exception:
+        pass
+    return f"data:{mt};base64," + base64.b64encode(raw).decode()
+
+
+def call(prompt, model, max_tokens, timeout, retries=1, images=None, max_edge=1280):
+    images = images or []
+    if images:
+        parts = [{"type": "text", "text": prompt}]
+        for p in images:
+            try:
+                parts.append({"type": "image_url", "image_url": {"url": encode_image(p, max_edge)}})
+            except Exception as e:
+                return {"response": "", "reasoning_len": 0, "usage": {}, "error": f"图片读取失败 {p}: {e}"}
+        content = parts
+    else:
+        content = prompt
+    body = json.dumps({"model": model, "max_tokens": max_tokens,
+                       "messages": [{"role": "user", "content": content}]}).encode()
+    last = None
+    for i in range(retries + 1):
+        try:
+            req = Request(API, data=body, method="POST",
+                          headers={"Authorization": "Bearer " + KEY,
+                                   "Content-Type": "application/json"})
+            with urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read())
+            msg = d["choices"][0]["message"]
+            u = d.get("usage", {})
+            return {"response": msg.get("content") or "",
+                    "reasoning_len": len(msg.get("reasoning_content") or ""),
+                    "usage": {"prompt_tokens": u.get("prompt_tokens", 0),
+                              "completion_tokens": u.get("completion_tokens", 0)}}
+        except Exception as e:
+            last = e
+            time.sleep(2 * (i + 1))
+    return {"response": "", "reasoning_len": 0, "usage": {}, "error": str(last)}
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("prompt", nargs="?")
+    ap.add_argument("-f", "--file")
+    ap.add_argument("--jsonl")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("--image", action="append", default=[])
+    ap.add_argument("--image-max-edge", type=int, default=1280)
+    ap.add_argument("--max-tokens", type=int, default=16384)
+    ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--model", default="deepseek-flash")
+    ap.add_argument("--timeout", type=int, default=240)
+    a = ap.parse_args()
+
+    if a.jsonl:
+        tasks = [json.loads(l) for l in open(a.jsonl, encoding="utf-8") if l.strip()]
+        if not tasks:
+            sys.exit("任务文件为空")
+        def run(t):
+            r = call(t["prompt"], a.model, a.max_tokens, a.timeout,
+                     images=t.get("images") or a.image, max_edge=a.image_max_edge)
+            return {"id": t.get("id"), "response": r["response"],
+                    "usage": r["usage"], **({"error": r["error"]} if "error" in r else {})}
+        with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
+            results = list(ex.map(run, tasks))
+        out = "\n".join(json.dumps(x, ensure_ascii=False) for x in results)
+        if a.out:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(out + "\n")
+        else:
+            print(out)
+        tp = sum((x.get("usage") or {}).get("prompt_tokens", 0) for x in results)
+        tc = sum((x.get("usage") or {}).get("completion_tokens", 0) for x in results)
+        nerr = sum(1 for x in results if "error" in x)
+        print(f"[ds] {len(results)}条完成 失败{nerr}条 in={tp} out={tc} tokens", file=sys.stderr)
+    else:
+        prompt = a.prompt or (open(a.file, encoding="utf-8").read() if a.file else sys.stdin.read())
+        if not prompt.strip():
+            sys.exit("空 prompt")
+        r = call(prompt, a.model, a.max_tokens, a.timeout,
+                 images=a.image, max_edge=a.image_max_edge)
+        if "error" in r:
+            sys.exit(f"[ds] {r['error']}")
+        print(r["response"])
+        u = r["usage"]
+        print(f"[ds] in={u['prompt_tokens']} out={u['completion_tokens']} tokens", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
