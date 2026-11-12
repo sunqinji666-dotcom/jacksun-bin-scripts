@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""aiplace — 孙哥的全盘落盘入口。
+
+任何文件（不管哪个 AI、哪个软件生成的）都先用它归位，不许直接扔桌面。
+
+用法:
+  aiplace <路径>...            归位（移动）
+  aiplace -c <路径>...         归位（复制，保留原件）
+  aiplace --to 素材库 <路径>    强制归到指定区
+  aiplace sweep                扫描桌面/下载的散落文件，只列不动
+  aiplace sweep --apply        扫描并归位
+  aiplace where <关键词>       查找文件在哪
+  aiplace status               各区体积与待归类数量
+  aiplace rules                查看落盘规则
+"""
+import os
+import sys
+import json
+import time
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+DOCS = HOME / "Documents"
+INBOX = DOCS / "00_收件箱"
+LOG = HOME / ".local/share/aiplace/log.jsonl"
+
+# 标准区
+MATERIAL = DOCS / "02_素材库"
+TOOLS = DOCS / "03_视频工具与插件"
+DEV = DOCS / "04_软件开发"
+HW = DOCS / "05_设备与硬件折腾"
+PERSONAL = DOCS / "06_个人与备份归档"
+DELIVERY = DOCS / "07_交付与客户"
+DOWNLOADS = HOME / "Downloads"
+
+SUB = "_待归类"
+
+VIDEO = {".mov", ".mp4", ".mxf", ".r3d", ".braw", ".mkv", ".avi", ".m4v", ".mts", ".insv"}
+AUDIO = {".wav", ".aif", ".aiff", ".mp3", ".m4a", ".flac", ".ogg"}
+IMAGE = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".webp", ".psd", ".exr", ".dpx", ".svg"}
+DOC = {".md", ".txt", ".pdf", ".docx", ".pages", ".numbers", ".xlsx", ".pptx", ".csv", ".rtf"}
+CODE = {".py", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".swift", ".go", ".rs", ".sh", ".html", ".css", ".json", ".yaml", ".yml", ".toml"}
+PKG = {".dmg", ".pkg", ".iso", ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".ipa", ".apk"}
+
+DELIVERY_WORDS = ("成片", "成品", "交付", "final", "定稿", "客户版", "报价", "合同", "发票")
+
+
+def now():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def log(entry):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def looks_like_project(p: Path) -> bool:
+    """目录是不是一个代码项目。"""
+    if not p.is_dir():
+        return False
+    marks = [".git", "package.json", "SKILL.md", "pyproject.toml", "Cargo.toml",
+             "Go.mod", "go.mod", "Info.fcpxml", "README.md"]
+    if any((p / m).exists() for m in marks):
+        return True
+    return any(p.glob("*.xcodeproj")) or any(p.glob("*.fcpxmld")) or any(p.glob("*.fcpbundle"))
+
+
+def classify(p: Path):
+    """返回 (目标目录, 类别说明)。"""
+    name = p.name
+    low = name.lower()
+
+    # 启动器与脚本：不进文档区，归到 ~/.local/bin
+    if p.suffix.lower() in (".command", ".app") or (p.suffix.lower() == ".sh" and p.is_file()):
+        return HOME / ".local/bin", "启动器"
+
+    if looks_like_project(p):
+        return DEV / SUB if not any(k in low for k in ("fcpxml", "fcpbundle")) else MATERIAL / SUB, "代码项目"
+
+    ext = p.suffix.lower()
+
+    if ext in VIDEO:
+        if any(w in name for w in DELIVERY_WORDS):
+            return DELIVERY / SUB, "交付成片"
+        return MATERIAL / SUB, "视频素材"
+    if ext in AUDIO:
+        return MATERIAL / SUB, "音频"
+    if ext in IMAGE:
+        return MATERIAL / SUB, "图片"
+    if ext in PKG:
+        return DOWNLOADS / "04_压缩包与安装包", "安装包/压缩包"
+    if ext in DOC:
+        return PERSONAL / SUB, "文档"
+    if ext in CODE:
+        return DEV / SUB, "代码文件"
+    return INBOX, "未分类"
+
+
+FORCE = {
+    "收件箱": INBOX,
+    "素材库": MATERIAL / SUB,
+    "工具": TOOLS / SUB,
+    "软件": DEV / SUB,
+    "硬件": HW / SUB,
+    "个人": PERSONAL / SUB,
+    "交付": DELIVERY / SUB,
+    "下载": DOWNLOADS,
+}
+
+
+def unique(dest: Path) -> Path:
+    if not dest.exists():
+        return dest
+    stem, suf = dest.stem, dest.suffix
+    return dest.with_name(f"{stem}_{now()}{suf}")
+
+
+def place(path: str, copy=False, force=None):
+    src = Path(path).expanduser().resolve()
+    if not src.exists():
+        print(f"✗ 不存在: {src}")
+        return False
+    if force:
+        dest_dir, kind = FORCE[force], f"强制→{force}"
+    else:
+        dest_dir, kind = classify(src)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = unique(dest_dir / src.name)
+    try:
+        if copy:
+            if src.is_dir():
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            act = "复制"
+        else:
+            shutil.move(str(src), str(dest))
+            act = "移动"
+    except Exception as e:
+        print(f"✗ {src.name}: {e}")
+        return False
+    rel = dest.relative_to(HOME)
+    print(f"✓ {act} {src.name} → ~/{rel}  [{kind}]")
+    log({"t": now(), "action": act, "src": str(src), "dest": str(dest), "kind": kind})
+    return True
+
+
+def sweep(apply=False):
+    """扫描桌面与下载根级的散落文件（不含目录、不含已知项目文件夹）。"""
+    targets = [HOME / "Desktop", DOWNLOADS]
+    found = []
+    for base in targets:
+        if not base.exists():
+            continue
+        for p in sorted(base.iterdir()):
+            if p.name.startswith("."):
+                continue
+            # 桌面上的目录一律不动（多为未结算项目），只处理根级散文件
+            if p.is_dir() and base.name == "Desktop":
+                continue
+            if p.is_dir() and p.name.startswith("0"):
+                continue
+            found.append(p)
+    if not found:
+        print("没有需要归位的散落文件。")
+        return
+    print(f"发现 {len(found)} 项待归位：\n")
+    big = []
+    for p in found:
+        dest_dir, kind = classify(p)
+        size = 0
+        if p.is_file():
+            size = p.stat().st_size
+        elif p.is_dir():
+            size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        flag = ""
+        if size > 5 * 1024**3:
+            flag = "  ⚠️ 超过 5G，需手动 place"
+            big.append(p)
+        try:
+            rel = dest_dir.relative_to(HOME)
+        except ValueError:
+            rel = dest_dir
+        print(f"  {p.name:<50} → ~/{rel}  [{kind}]{flag}")
+    if apply:
+        print()
+        for p in found:
+            if p in big:
+                print(f"⏭  跳过 {p.name}（大于 5G）")
+                continue
+            place(str(p))
+    else:
+        print("\n加 --apply 执行归位。")
+
+
+def where(kw):
+    paths = [str(DOCS), str(HOME / "Desktop"), str(HOME / "Movies"),
+             str(HOME / "Downloads"), str(HOME / "Pictures")]
+    cmd = ["mdfind", "-onlyin", paths[0]]
+    for p in paths[1:]:
+        cmd += ["-onlyin", p]
+    cmd.append(kw)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:
+        out = ""
+    if not out:
+        print(f"没有找到包含「{kw}」的文件。")
+        return
+    hits = out.splitlines()[:40]
+    print(f"找到 {len(hits)} 项：")
+    for h in hits:
+        try:
+            print("  " + str(Path(h).relative_to(HOME)))
+        except ValueError:
+            print("  " + h)
+
+
+def status():
+    print(f"{'区':<24}{'体积':>10}{'待归类':>8}")
+    total = 0
+    for d in [INBOX, MATERIAL, TOOLS, DEV, HW, PERSONAL, DELIVERY]:
+        if not d.exists():
+            size, n = "—", 0
+        else:
+            r = subprocess.run(["du", "-sh", str(d)], capture_output=True, text=True)
+            size = r.stdout.split("\t")[0] if r.stdout else "?"
+            sub = d / SUB
+            n = len(list(sub.iterdir())) if sub.exists() else 0
+        print(f"{d.name:<24}{size:>10}{n:>8}")
+    print()
+    desktop = HOME / "Desktop"
+    if desktop.exists():
+        loose = [p for p in desktop.iterdir() if p.is_file() and not p.name.startswith(".")]
+        print(f"桌面根级散落文件: {len(loose)} 个（aiplace sweep 可查看）")
+
+
+def rules():
+    print("""落盘规则
+─────────────────────────────────────────
+代码项目（含 .git/package.json/SKILL.md）  → 04_软件开发/_待归类/
+FCP 工程（.fcpxmld/.fcpbundle）           → 02_素材库/_待归类/
+视频（命名含 成片/交付/final/定稿）        → 07_交付与客户/_待归类/
+其他视频 / 音频 / 图片                    → 02_素材库/_待归类/
+文档（md/pdf/docx/numbers…）              → 06_个人与备份归档/_待归类/
+代码文件（单个 .py/.js/.swift…）           → 04_软件开发/_待归类/
+安装包与压缩包（dmg/zip/apk…）             → ~/Downloads/04_压缩包与安装包/
+其余                                      → 00_收件箱/
+
+强制指定：aiplace --to 交付 <路径>
+─────────────────────────────────────────""")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = args[0]
+    if cmd in ("sweep", "status", "where", "rules"):
+        if cmd == "sweep":
+            sweep("--apply" in args)
+        elif cmd == "where":
+            if len(args) < 2:
+                print("用法: aiplace where <关键词>")
+                return
+            where(" ".join(args[1:]))
+        elif cmd == "status":
+            status()
+        else:
+            rules()
+        return
+    copy = False
+    force = None
+    paths = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--copy"):
+            copy = True
+        elif a == "--to":
+            i += 1
+            force = args[i] if i < len(args) else None
+        else:
+            paths.append(a)
+        i += 1
+    if not paths:
+        print("用法: aiplace <路径>...  （aiplace --help 看全部）")
+        return
+    for p in paths:
+        place(p, copy=copy, force=force)
+
+
+if __name__ == "__main__":
+    main()
