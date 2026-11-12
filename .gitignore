@@ -21,3 +21,6 @@ __pycache__/
 *.pdf
 *.jsonl
 *.db
+
+# 第三方二进制
+sing-box
